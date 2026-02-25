@@ -4,14 +4,20 @@ set -euo pipefail
 # ----------------------------
 # Step 0 — Variables
 # ----------------------------
+# Defaults
 DRY_RUN=0
 FULL_DRY_RUN=0
+UNDO=0
+UNDO_DRY_RUN=0
 DEFAULT_ROOT="$HOME/Downloads"
 
+# Single-pass arg parsing
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
         --dry-run-full) FULL_DRY_RUN=1 ;;
+        --undo) UNDO=1 ;;
+        --undo-dry-run) UNDO_DRY_RUN=1 ;;
     esac
 done
 
@@ -73,7 +79,12 @@ select_root() {
 
     # Otherwise search entire HOME
     else
-        ROOT=$(fd -t d -i --no-ignore "$input" "$HOME" 2>/dev/null | fzf)
+        # Try fd+fzf if available, otherwise fallback to find
+        if command -v fd >/dev/null 2>&1 && command -v fzf >/dev/null 2>&1; then
+            ROOT=$(fd -t d -i --no-ignore "$input" "$HOME" 2>/dev/null | fzf)
+        else
+            ROOT=$(find "$HOME" -type d -iname "*$input*" 2>/dev/null | head -n1 || true)
+        fi
 
         if [[ -z "$ROOT" ]]; then
             log_error "No matching folders found."
@@ -95,9 +106,15 @@ select_root() {
 scan_files() {
     log_info "Scanning files recursively..."
     FILES=()
-    while IFS= read -r -d '' file; do
-        FILES+=("$file")
-    done < <(fd -t f -0 . "$ROOT" 2>/dev/null || true)
+    if command -v fd >/dev/null 2>&1; then
+        while IFS= read -r -d '' file; do
+            FILES+=("$file")
+        done < <(fd -t f -0 . "$ROOT" 2>/dev/null || true)
+    else
+        while IFS= read -r -d '' file; do
+            FILES+=("$file")
+        done < <(find "$ROOT" -type f -print0 2>/dev/null || true)
+    fi
 
     if [[ "${#FILES[@]}" -eq 0 ]]; then
         log_info "No files found inside $ROOT"
@@ -159,8 +176,15 @@ confirm_action() {
 # ----------------------------
 execute_move() {
     log_info "Moving files..."
-    LOG_FILE="$ROOT/huborganizer.log"   # <-- now visible
+
+    LOG_FILE="$ROOT/huborganizer.log"
     touch "$LOG_FILE"
+
+    # Generate Run ID
+    RUN_ID=$(date +"%Y-%m-%d_%H-%M-%S")
+
+    # Mark run start
+    echo "=== RUN START: $RUN_ID ===" >> "$LOG_FILE"
 
     for file in "${FILES[@]}"; do
         dest="${FILE_DESTINATIONS[$file]}"
@@ -181,12 +205,121 @@ execute_move() {
         fi
 
         mv "$file" "$target"
+
         echo "$(date '+%Y-%m-%d %H:%M:%S') | $file → $target" >> "$LOG_FILE"
     done
+
+    # Mark run end
+    echo "=== RUN END: $RUN_ID ===" >> "$LOG_FILE"
+    echo >> "$LOG_FILE"
 
     log_success "Organization complete."
     log_info "Log saved to $LOG_FILE"
 }
+
+# ----------------------------
+# Undo — Extract Last Run
+# ----------------------------
+get_last_run_entries() {
+    LOG_FILE="$ROOT/huborganizer.log"
+
+    if [[ ! -f "$LOG_FILE" ]]; then
+        log_error "No log file found."
+        exit 1
+    fi
+
+    LAST_RUN_ID=$(grep "=== RUN START:" "$LOG_FILE" | tail -n1 | sed 's/=== RUN START: \(.*\) ===/\1/')
+
+    if [[ -z "$LAST_RUN_ID" ]]; then
+        log_error "No previous runs found."
+        exit 1
+    fi
+
+    awk "/=== RUN START: $LAST_RUN_ID ===/,/=== RUN END: $LAST_RUN_ID ===/" "$LOG_FILE" \
+        | grep " | "
+}
+
+# ----------------------------
+# Undo — Restore Last Run
+# ----------------------------
+undo_last_run() {
+    log_info "Preparing undo..."
+
+    entries=$(get_last_run_entries)
+
+    if [[ -z "$entries" ]]; then
+        log_error "Nothing to undo."
+        exit 1
+    fi
+
+    echo
+    log_info "Undoing last run..."
+
+    while IFS= read -r line; do
+
+        old=$(echo "$line" | awk -F' \\| ' '{print $2}' | awk -F' → ' '{print $1}')
+        new=$(echo "$line" | awk -F' → ' '{print $2}')
+
+        if [[ ! -f "$new" ]]; then
+            log_error "Missing file: $new (skipped)"
+            continue
+        fi
+
+        mkdir -p "$(dirname "$old")"
+
+        target="$old"
+
+        if [[ -e "$target" ]]; then
+            name="${old%.*}"
+            ext="${old##*.}"
+            counter=1
+            while [[ -e "${name}_restored_$counter.$ext" ]]; do
+                ((counter++))
+            done
+            target="${name}_restored_$counter.$ext"
+        fi
+
+        if [[ $UNDO_DRY_RUN -eq 1 ]]; then
+            echo "[UNDO DRY RUN] $new → $target"
+        else
+            mv "$new" "$target"
+            echo "Restored: $target"
+        fi
+
+    done <<< "$entries"
+
+    if [[ $UNDO_DRY_RUN -eq 0 ]]; then
+        log_success "Undo complete."
+    fi
+
+    # After successful undo, clean up empty category folders
+    if [[ $UNDO_DRY_RUN -eq 0 ]]; then
+        cleanup_categories_after_undo
+    fi
+}
+
+
+# ----------------------------
+# Post-undo cleanup of empty category folders
+# ----------------------------
+cleanup_categories_after_undo() {
+    # Only run actual deletions when not a dry run
+    if [[ $UNDO_DRY_RUN -eq 1 ]]; then
+        log_info "Undo dry-run: skipping post-undo cleanup."
+        return
+    fi
+
+    # Remove any empty directories under ROOT (category/subcategory folders)
+    # Delete bottom-up to ensure nested empties are removed.
+    deleted=$(find "$ROOT" -depth -type d -empty ! -path "$ROOT" -print -delete 2>/dev/null | wc -l || true)
+
+    if [[ $deleted -gt 0 ]]; then
+        log_success "Post-undo cleanup removed $deleted empty folder(s) under $ROOT"
+    else
+        log_info "No empty category folders to remove."
+    fi
+}
+
 
 # ----------------------------
 # Step 7 — Delete Empty Folders
@@ -251,6 +384,11 @@ dry_run_preview() {
 # ----------------------------
 main() {
     select_root
+    # If undo flag set, perform undo and exit
+    if [[ $UNDO -eq 1 ]]; then
+        undo_last_run
+        exit 0
+    fi
     scan_files
     categorize_files
     show_summary
