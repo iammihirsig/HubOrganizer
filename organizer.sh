@@ -53,19 +53,36 @@ select_root() {
     echo
     read -rp "Select root folder [Default: $DEFAULT_ROOT, q to quit]: " input
 
+    # Quit
     if [[ "$input" == "q" ]]; then
         log_info "User chose to quit."
         exit 0
-    elif [[ -z "$input" ]]; then
-        ROOT="$DEFAULT_ROOT"
-    elif [[ -d "$input" ]]; then
-        ROOT="$input"
-    else
-        ROOT=$(fd -t d "$input" "$HOME" 2>/dev/null | fzf || true)
     fi
 
-    if [[ -z "${ROOT:-}" || ! -d "$ROOT" ]]; then
-        log_error "No folder selected or invalid path."
+    # Default
+    if [[ -z "$input" ]]; then
+        ROOT="$DEFAULT_ROOT"
+
+    # Absolute path
+    elif [[ "$input" = /* && -d "$input" ]]; then
+        ROOT="$input"
+
+    # Relative path from current directory
+    elif [[ -d "$PWD/$input" ]]; then
+        ROOT="$PWD/$input"
+
+    # Otherwise search entire HOME
+    else
+        ROOT=$(fd -t d -i --no-ignore "$input" "$HOME" 2>/dev/null | fzf)
+
+        if [[ -z "$ROOT" ]]; then
+            log_error "No matching folders found."
+            exit 1
+        fi
+    fi
+
+    if [[ ! -d "$ROOT" ]]; then
+        log_error "Invalid directory selected."
         exit 1
     fi
 
