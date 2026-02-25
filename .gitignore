@@ -1,0 +1,12 @@
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# Demo folders
+demo_data/
+
+# OS junk
+.DS_Store
